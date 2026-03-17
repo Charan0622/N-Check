@@ -14,9 +14,9 @@ const geistMono = localFont({
 });
 
 export const metadata: Metadata = {
-  title: "NCheck — AI-Powered Trust Verification",
+  title: "NCheck — Scam Detection That Actually Investigates",
   description:
-    "Paste anything suspicious. 6 AI agents analyze it in seconds. Get a trust score and detailed evidence report.",
+    "Paste anything suspicious. Real web searches, domain checks, and URL verification — not AI guesswork. Get a trust score backed by actual evidence.",
 };
 
 export default function RootLayout({
@@ -27,7 +27,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#09090b] text-zinc-200`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#050505] text-zinc-200`}
       >
         {children}
       </body>

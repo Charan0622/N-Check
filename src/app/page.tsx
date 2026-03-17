@@ -1,243 +1,227 @@
 "use client";
 
-import { useState, useCallback } from "react";
-import { AgentResult, TrustReport, EXAMPLE_INPUTS } from "@/lib/agents";
-import { runPipeline } from "@/lib/pipeline";
-import AgentPipeline from "@/components/AgentPipeline";
+import { useState, useCallback, useReducer } from "react";
+import { EXAMPLE_INPUTS } from "@/config/examples";
+import type { StreamEvent, FinalVerdict } from "@/types";
+import LiveFeed from "@/components/LiveFeed";
 import VerdictCard from "@/components/VerdictCard";
+
+interface AppState {
+  phase: "landing" | "analyzing" | "results";
+  events: StreamEvent[];
+  currentStage: string | null;
+  verdict: FinalVerdict | null;
+  error: string | null;
+}
+
+type Action =
+  | { type: "START" }
+  | { type: "EVENT"; event: StreamEvent }
+  | { type: "RESET" }
+  | { type: "ERROR"; message: string };
+
+function reducer(state: AppState, action: Action): AppState {
+  switch (action.type) {
+    case "START":
+      return { phase: "analyzing", events: [], currentStage: null, verdict: null, error: null };
+    case "EVENT": {
+      const e = action.event;
+      const newEvents = [...state.events, e];
+      if (e.type === "stage_start") return { ...state, events: newEvents, currentStage: e.stage };
+      if (e.type === "stage_complete") return { ...state, events: newEvents };
+      if (e.type === "verdict") return { ...state, phase: "results", events: newEvents, currentStage: null, verdict: e.data as FinalVerdict };
+      if (e.type === "error" && (e as { fatal: boolean }).fatal) return { ...state, events: newEvents, error: e.message, phase: "results" };
+      return { ...state, events: newEvents };
+    }
+    case "ERROR":
+      return { ...state, phase: "results", error: action.message };
+    case "RESET":
+      return { phase: "landing", events: [], currentStage: null, verdict: null, error: null };
+    default:
+      return state;
+  }
+}
 
 export default function Home() {
   const [content, setContent] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [isRunning, setIsRunning] = useState(false);
-  const [report, setReport] = useState<TrustReport | null>(null);
-  const [agentStatuses, setAgentStatuses] = useState<
-    Record<string, "pending" | "running" | "complete" | "error">
-  >({});
-  const [agentResults, setAgentResults] = useState<
-    Record<string, AgentResult>
-  >({});
-  const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [showApiInput, setShowApiInput] = useState(false);
+  const [state, dispatch] = useReducer(reducer, {
+    phase: "landing",
+    events: [],
+    currentStage: null,
+    verdict: null,
+    error: null,
+  });
 
   const handleAnalyze = useCallback(async () => {
     if (!content.trim()) return;
-
-    setIsRunning(true);
-    setReport(null);
-    setError(null);
-    setExpandedAgent(null);
-    setAgentStatuses({});
-    setAgentResults({});
+    dispatch({ type: "START" });
 
     try {
-      const result = await runPipeline(content.trim(), apiKey.trim(), {
-        onAgentStart: (agentId) => {
-          setAgentStatuses((prev) => ({ ...prev, [agentId]: "running" }));
-        },
-        onAgentComplete: (agentId, agentResult) => {
-          setAgentStatuses((prev) => ({ ...prev, [agentId]: "complete" }));
-          setAgentResults((prev) => ({ ...prev, [agentId]: agentResult }));
-        },
-        onError: (agentId, errMsg) => {
-          setAgentStatuses((prev) => ({ ...prev, [agentId]: "error" }));
-          setAgentResults((prev) => ({
-            ...prev,
-            [agentId]: {
-              agentId,
-              agentName: agentId,
-              status: "error" as const,
-              findings: errMsg,
-            },
-          }));
-        },
+      const response = await fetch("/api/stream-analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: content.trim(), apiKey: apiKey.trim() || undefined }),
       });
-      setReport(result);
+
+      if (!response.ok) {
+        const err = await response.text();
+        dispatch({ type: "ERROR", message: `Server error: ${err}` });
+        return;
+      }
+
+      const reader = response.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+        for (const part of parts) {
+          const line = part.trim();
+          if (line.startsWith("data: ")) {
+            try {
+              const event = JSON.parse(line.slice(6)) as StreamEvent;
+              dispatch({ type: "EVENT", event });
+            } catch { /* skip malformed events */ }
+          }
+        }
+      }
     } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "An unexpected error occurred"
-      );
-    } finally {
-      setIsRunning(false);
+      dispatch({ type: "ERROR", message: err instanceof Error ? err.message : "Connection failed" });
     }
   }, [content, apiKey]);
 
-  const handleExampleClick = (exampleContent: string) => {
-    setContent(exampleContent);
-    setReport(null);
-    setAgentStatuses({});
-    setAgentResults({});
-    setExpandedAgent(null);
-    setError(null);
-  };
-
   const handleReset = () => {
     setContent("");
-    setReport(null);
-    setAgentStatuses({});
-    setAgentResults({});
-    setExpandedAgent(null);
-    setError(null);
-    setIsRunning(false);
+    dispatch({ type: "RESET" });
   };
 
-  const completedCount = Object.values(agentStatuses).filter(s => s === "complete").length;
-  const runningCount = Object.values(agentStatuses).filter(s => s === "running").length;
+  const isLanding = state.phase === "landing";
 
   return (
-    <main className="min-h-screen bg-grid-pattern bg-noise relative">
-      {/* Header */}
-      <header className="border-b border-zinc-800/40 bg-zinc-950/80 backdrop-blur-xl sticky top-0 z-50">
-        <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-white to-zinc-300 flex items-center justify-center shadow-lg shadow-white/5">
-              <span className="text-zinc-950 font-bold text-sm tracking-tight">N</span>
-            </div>
-            <div className="flex flex-col">
-              <span className="text-base font-semibold text-zinc-50 tracking-tight leading-none">NCheck</span>
-              <span className="text-[10px] text-zinc-500 tracking-wide">SCAM INTELLIGENCE</span>
-            </div>
+    <main className="min-h-screen bg-mesh bg-dots relative overflow-x-hidden" style={{ background: "#050505" }}>
+      {/* Ambient glow */}
+      <div className="fixed top-0 left-1/2 -translate-x-1/2 w-[800px] h-[400px] bg-nvidia-500/[0.04] rounded-full blur-[120px] pointer-events-none" />
+
+      {/* Nav */}
+      <nav className="fixed top-0 left-0 right-0 z-50 border-b border-white/[0.04]" style={{ background: "rgba(5,5,5,0.8)", backdropFilter: "blur(20px)" }}>
+        <div className="max-w-6xl mx-auto px-6 h-12 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <svg viewBox="0 0 28 28" fill="none" className="w-6 h-6">
+              <path d="M14 1.5L3 6.5v7.5c0 7 4.7 13.5 11 15 6.3-1.5 11-8 11-15V6.5L14 1.5z" fill="url(#lg2)" fillOpacity="0.9" />
+              <path d="M11.5 14.5l2 2 4-4" stroke="#fff" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+              <defs><linearGradient id="lg2" x1="14" y1="1" x2="14" y2="29"><stop stopColor="#86c811"/><stop offset="1" stopColor="#4d7a00"/></linearGradient></defs>
+            </svg>
+            <span className="text-sm font-semibold text-white/80">NCheck</span>
           </div>
-          <div className="flex items-center gap-3">
-            <button
-              type="button"
-              onClick={() => setShowApiInput((prev) => !prev)}
-              className={`text-xs px-3.5 py-1.5 rounded-lg transition-all duration-200 flex items-center gap-2 ${
-                apiKey
-                  ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 hover:bg-emerald-500/15"
-                  : "text-zinc-400 bg-zinc-800 border border-zinc-700 hover:bg-zinc-700"
-              }`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full ${apiKey ? "bg-emerald-400" : "bg-zinc-500"}`} />
-              {apiKey ? "API Connected" : "Set API Key"}
-            </button>
-          </div>
+          <button
+            onClick={() => setShowApiInput((p) => !p)}
+            className={`text-[10px] h-6 px-2 rounded-md flex items-center gap-1.5 font-medium transition-all ${
+              apiKey ? "text-nvidia-400/70 bg-nvidia-500/8 border border-nvidia-500/10" : "text-white/20 bg-white/[0.02] border border-white/[0.04] hover:border-white/[0.08]"
+            }`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full ${apiKey ? "bg-nvidia-400" : "bg-white/15"}`} />
+            {apiKey ? "Connected" : "API Key"}
+          </button>
         </div>
         {showApiInput && (
-          <div className="max-w-6xl mx-auto px-6 pb-4 animate-slide-up">
-            <div className="flex gap-2 p-3 rounded-lg bg-zinc-900/80 border border-zinc-800/60">
-              <input
-                type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder="Enter NVIDIA API key (nvapi-...)"
-                className="flex-1 bg-zinc-800/50 border border-zinc-700/50 rounded-lg px-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 focus:outline-none focus:border-indigo-500/40 transition-all"
-              />
-              <button
-                onClick={() => setShowApiInput(false)}
-                className="px-5 py-2 text-sm bg-white text-zinc-950 font-medium rounded-lg hover:bg-zinc-200 transition-colors"
-              >
-                Save
-              </button>
+          <div className="max-w-6xl mx-auto px-6 pb-2 animate-slide-up">
+            <div className="flex gap-2 p-2 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+              <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="nvapi-..."
+                className="flex-1 bg-transparent border border-white/[0.04] rounded-md px-2.5 py-1 text-[11px] text-white/60 placeholder-white/15 focus:outline-none focus:border-nvidia-500/20 font-mono" />
+              <button onClick={() => setShowApiInput(false)} className="btn-primary px-3 py-1 text-[11px] rounded-md">Save</button>
             </div>
           </div>
         )}
-      </header>
+      </nav>
 
-      <div className="max-w-6xl mx-auto px-6 py-10 relative z-10">
-        {/* Hero */}
-        {!isRunning && !report && (
-          <div className="text-center mb-14 animate-fade-in">
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 text-xs font-medium mb-6">
-              <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-dot-1" />
-              Powered by 6 AI Agents
-            </div>
-            <h2 className="text-4xl sm:text-5xl font-bold text-zinc-50 mb-4 tracking-tight leading-tight">
-              Paste anything suspicious.
-              <br />
-              <span className="bg-gradient-to-r from-zinc-400 to-zinc-500 bg-clip-text text-transparent">
-                Know the truth in seconds.
-              </span>
-            </h2>
-            <p className="text-zinc-500 text-sm max-w-lg mx-auto leading-relaxed">
-              Our multi-agent AI pipeline classifies, extracts entities, researches claims,
-              detects forensic patterns, analyzes manipulation tactics, and delivers a definitive trust verdict.
+      <div className="max-w-6xl mx-auto px-6 pt-20 pb-16 relative z-10">
+        {/* Hero — landing only */}
+        {isLanding && (
+          <div className="text-center pt-12 mb-14 animate-fade-in">
+            <h1 className="text-7xl sm:text-8xl font-black tracking-tighter leading-none mb-4">
+              <span className="bg-gradient-to-b from-white via-white to-white/40 bg-clip-text text-transparent">N</span>
+              <span className="bg-gradient-to-b from-nvidia-400 via-nvidia-500 to-nvidia-700 bg-clip-text text-transparent">Check</span>
+            </h1>
+            <p className="text-white/25 text-base max-w-md mx-auto leading-relaxed font-light mb-2">
+              Don&apos;t get scammed. Paste it. We&apos;ll investigate.
+            </p>
+            <p className="text-white/10 text-xs max-w-sm mx-auto leading-relaxed">
+              Real web searches. Real domain checks. Real evidence.
+              Not AI guesswork — actual investigation.
             </p>
           </div>
         )}
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-          {/* Left: Input */}
-          <div className="space-y-5">
-            <div>
-              <div className="relative group">
-                <textarea
-                  value={content}
-                  onChange={(e) => setContent(e.target.value)}
-                  placeholder="Paste a job offer, apartment listing, crypto pitch, online store, DM, email, or anything you want to verify..."
-                  className="w-full h-52 bg-zinc-900/60 border border-zinc-800/80 rounded-xl px-5 py-4 text-sm text-zinc-200 placeholder-zinc-600 resize-none focus:outline-none input-glow transition-all duration-300"
-                  disabled={isRunning}
-                />
-                <div className="absolute bottom-3 right-3 opacity-0 group-focus-within:opacity-100 transition-opacity">
-                  <span className="text-[10px] text-zinc-600 bg-zinc-800/80 px-2 py-0.5 rounded">
-                    Paste or type content
-                  </span>
-                </div>
-              </div>
-              <div className="flex items-center justify-between mt-3">
-                <span className="text-xs text-zinc-600 tabular-nums">
-                  {content.length > 0 ? `${content.length} characters` : ""}
-                </span>
+        {/* Compact header when analyzing/results */}
+        {!isLanding && (
+          <div className="flex items-center justify-between mb-6 pt-2">
+            <h2 className="text-lg font-bold tracking-tight">
+              <span className="text-white/80">N</span>
+              <span className="text-nvidia-400/80">Check</span>
+              <span className="text-white/15 text-sm font-normal ml-2">Investigation</span>
+            </h2>
+            <button onClick={handleReset} className="text-[11px] text-white/20 hover:text-white/40 transition-colors font-medium">
+              New analysis
+            </button>
+          </div>
+        )}
+
+        <div className={`grid grid-cols-1 ${isLanding ? "" : "lg:grid-cols-12"} gap-6`}>
+          {/* Left column */}
+          <div className={isLanding ? "max-w-2xl mx-auto w-full" : "lg:col-span-5 space-y-4"}>
+            {/* Input */}
+            <div className="glass rounded-2xl p-1 gradient-border">
+              <textarea
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                placeholder="Paste a suspicious message, job offer, apartment listing, crypto pitch, DM, email, or anything you want to verify..."
+                className="w-full h-40 bg-transparent rounded-xl px-4 py-3 text-[13px] text-white/70 placeholder-white/12 resize-none focus:outline-none leading-relaxed"
+                disabled={state.phase === "analyzing"}
+              />
+              <div className="flex items-center justify-between px-3 pb-2">
+                <span className="text-[10px] text-white/10 font-mono">{content.length > 0 ? `${content.length}` : ""}</span>
                 <div className="flex gap-2">
-                  {(content || report) && (
-                    <button
-                      onClick={handleReset}
-                      className="px-4 py-2 text-xs text-zinc-500 hover:text-zinc-300 rounded-lg border border-zinc-800 hover:border-zinc-600 transition-all duration-200"
-                      disabled={isRunning}
-                    >
-                      Clear
-                    </button>
+                  {content && state.phase !== "analyzing" && (
+                    <button onClick={handleReset} className="px-2.5 py-1 text-[11px] text-white/15 hover:text-white/30 rounded-md transition-colors">Clear</button>
                   )}
                   <button
                     onClick={handleAnalyze}
-                    disabled={!content.trim() || isRunning}
-                    className="px-6 py-2 bg-gradient-to-b from-white to-zinc-200 text-zinc-950 text-sm font-semibold rounded-lg hover:from-zinc-100 hover:to-zinc-300 disabled:from-zinc-800 disabled:to-zinc-800 disabled:text-zinc-600 transition-all duration-200 shadow-lg shadow-white/5 disabled:shadow-none"
+                    disabled={!content.trim() || state.phase === "analyzing"}
+                    className="btn-primary px-4 py-1.5 text-[12px] rounded-lg flex items-center gap-1.5"
                   >
-                    {isRunning ? (
-                      <span className="flex items-center gap-2">
-                        <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
-                          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="42" strokeDashoffset="12" strokeLinecap="round" />
-                        </svg>
-                        Analyzing...
-                      </span>
-                    ) : "Analyze Content"}
+                    {state.phase === "analyzing" ? (
+                      <>
+                        <svg className="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="42" strokeDashoffset="12" strokeLinecap="round" /></svg>
+                        Investigating
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
+                        Investigate
+                      </>
+                    )}
                   </button>
                 </div>
               </div>
             </div>
 
-            {error && (
-              <div className="p-4 rounded-xl bg-red-950/20 border border-red-500/20 text-red-400 text-sm flex items-start gap-3 animate-slide-up">
-                <svg className="w-4 h-4 mt-0.5 shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
-                </svg>
-                {error}
-              </div>
-            )}
-
-            {!isRunning && !report && (
-              <div className="animate-fade-in">
-                <p className="text-[10px] text-zinc-600 mb-3 uppercase tracking-widest font-medium">
-                  Try an example
-                </p>
-                <div className="grid grid-cols-2 gap-2.5">
-                  {EXAMPLE_INPUTS.map((example) => (
-                    <button
-                      key={example.title}
-                      onClick={() => handleExampleClick(example.content)}
-                      className="text-left px-4 py-3 rounded-xl border border-zinc-800/50 hover:border-zinc-600/60 bg-zinc-900/30 hover:bg-zinc-900/60 transition-all duration-200 group"
-                    >
-                      <div className="flex items-center gap-2.5">
-                        <span className="text-lg group-hover:animate-float">{example.icon}</span>
-                        <div>
-                          <span className="text-xs text-zinc-400 group-hover:text-zinc-200 transition-colors font-medium block">
-                            {example.title}
-                          </span>
-                          <span className="text-[10px] text-zinc-600 group-hover:text-zinc-500 transition-colors">
-                            Click to load
-                          </span>
-                        </div>
+            {/* Examples — landing only */}
+            {isLanding && (
+              <div className="animate-fade-in mt-6">
+                <p className="text-[10px] text-white/10 uppercase tracking-[0.2em] font-medium mb-2 px-1">Try an example</p>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                  {EXAMPLE_INPUTS.map((ex) => (
+                    <button key={ex.title} onClick={() => setContent(ex.content)}
+                      className="glass-hover text-left px-3 py-2 rounded-lg group">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-sm opacity-40 group-hover:opacity-80 transition-opacity">{ex.icon}</span>
+                        <span className="text-[11px] text-white/20 group-hover:text-white/60 transition-colors font-medium">{ex.title}</span>
                       </div>
                     </button>
                   ))}
@@ -245,79 +229,46 @@ export default function Home() {
               </div>
             )}
 
-            {(isRunning || report) && (
-              <div className="animate-slide-up">
-                <AgentPipeline
-                  agentStatuses={agentStatuses}
-                  agentResults={agentResults}
-                  expandedAgent={expandedAgent}
-                  onToggleAgent={(id) =>
-                    setExpandedAgent(expandedAgent === id ? null : id)
-                  }
-                />
-              </div>
+            {/* Live feed — during/after analysis */}
+            {!isLanding && state.events.length > 0 && (
+              <LiveFeed events={state.events} currentStage={state.phase === "analyzing" ? state.currentStage : null} />
             )}
           </div>
 
-          {/* Right: Results */}
-          <div>
-            {!isRunning && !report && (
-              <div className="h-full flex items-center justify-center">
-                <div className="text-center py-24 animate-fade-in">
-                  <div className="w-16 h-16 mx-auto mb-5 rounded-2xl border border-zinc-800/60 bg-zinc-900/40 flex items-center justify-center">
-                    <svg className="w-7 h-7 text-zinc-700" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z" />
-                    </svg>
-                  </div>
-                  <p className="text-zinc-500 text-sm font-medium mb-1">
-                    Analysis results
-                  </p>
-                  <p className="text-zinc-700 text-xs">
-                    Paste content and click Analyze to get started
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {isRunning && !report && (
-              <div className="h-full flex items-center justify-center">
-                <div className="text-center py-24 animate-fade-in">
-                  <div className="relative w-16 h-16 mx-auto mb-5">
-                    <div className="absolute inset-0 rounded-full border-2 border-zinc-800" />
-                    <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-indigo-400 animate-spin" />
-                    <div className="absolute inset-2 rounded-full border-2 border-transparent border-t-indigo-300/50 animate-spin" style={{ animationDirection: "reverse", animationDuration: "1.5s" }} />
-                    <div className="absolute inset-0 flex items-center justify-center">
-                      <span className="text-xs font-bold text-indigo-400 tabular-nums">{completedCount}/6</span>
+          {/* Right column — results */}
+          {!isLanding && (
+            <div className="lg:col-span-7">
+              {state.phase === "analyzing" && !state.verdict && (
+                <div className="flex items-center justify-center h-64">
+                  <div className="text-center">
+                    <div className="relative w-16 h-16 mx-auto mb-4">
+                      <svg className="w-16 h-16" style={{ animation: "ring-spin 2s linear infinite" }}>
+                        <circle cx="32" cy="32" r="28" fill="none" stroke="rgba(118,185,0,0.08)" strokeWidth="1" />
+                        <circle cx="32" cy="32" r="28" fill="none" stroke="rgba(118,185,0,0.4)" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="30 150" />
+                      </svg>
                     </div>
-                  </div>
-                  <p className="text-zinc-300 text-sm font-medium">Processing analysis...</p>
-                  <p className="text-zinc-600 text-xs mt-1.5">
-                    {runningCount > 0 ? `${runningCount} agent${runningCount > 1 ? "s" : ""} running` : "Initializing pipeline"}
-                    {completedCount > 0 && ` / ${completedCount} complete`}
-                  </p>
-                  <div className="mt-4 w-48 mx-auto h-1 bg-zinc-800 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-gradient-to-r from-indigo-500 to-indigo-400 rounded-full transition-all duration-500 ease-out"
-                      style={{ width: `${(completedCount / 6) * 100}%` }}
-                    />
+                    <p className="text-white/25 text-sm">Investigating...</p>
+                    <p className="text-white/10 text-[11px] mt-1">Watch the live feed for real-time updates</p>
                   </div>
                 </div>
-              </div>
-            )}
+              )}
 
-            {report && <VerdictCard report={report} />}
-          </div>
+              {state.verdict && <VerdictCard verdict={state.verdict} />}
+
+              {state.error && !state.verdict && (
+                <div className="p-4 rounded-xl bg-red-500/5 border border-red-500/10 text-red-400/60 text-sm">
+                  {state.error}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Footer */}
-        <footer className="mt-24 pt-6 border-t border-zinc-800/30 text-center">
-          <div className="flex items-center justify-center gap-2 text-[11px] text-zinc-600">
-            <span className="w-1 h-1 rounded-full bg-zinc-700" />
-            <span>NCheck</span>
-            <span className="w-1 h-1 rounded-full bg-zinc-700" />
-            <span>Powered by NVIDIA Nemotron</span>
-            <span className="w-1 h-1 rounded-full bg-zinc-700" />
-          </div>
+        <footer className="mt-20 pt-4 text-center">
+          <p className="text-[10px] text-white/8 tracking-widest uppercase">
+            NCheck &middot; Real investigation, not AI guesswork
+          </p>
         </footer>
       </div>
     </main>

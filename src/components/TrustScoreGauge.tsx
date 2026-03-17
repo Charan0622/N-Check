@@ -1,10 +1,8 @@
 "use client";
 
-import { TrustReport } from "@/lib/agents";
-
 interface Props {
   score: number;
-  severity: TrustReport["severity"];
+  severity: "SAFE" | "LOW_RISK" | "MODERATE_RISK" | "HIGH_RISK" | "CRITICAL_DANGER";
 }
 
 const SEVERITY_CONFIG = {
