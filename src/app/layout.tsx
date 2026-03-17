@@ -14,7 +14,7 @@ const geistMono = localFont({
 });
 
 export const metadata: Metadata = {
-  title: "TrustCheck AI — Universal Trust Verification",
+  title: "NCheck — AI-Powered Trust Verification",
   description:
     "Paste anything suspicious. 6 AI agents analyze it in seconds. Get a trust score and detailed evidence report.",
 };
@@ -27,7 +27,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#0a0a0f] text-zinc-200`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[#09090b] text-zinc-200`}
       >
         {children}
       </body>

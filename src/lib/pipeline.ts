@@ -1,7 +1,6 @@
 import { AGENTS, AgentResult, TrustReport } from "./agents";
 
-const OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions";
-const MODEL = "nvidia/llama-3.1-nemotron-70b-instruct";
+const MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1";
 
 interface PipelineCallbacks {
   onAgentStart: (agentId: string) => void;
@@ -14,13 +13,10 @@ async function callNemotron(
   userMessage: string,
   apiKey: string
 ): Promise<string> {
-  const response = await fetch(OPENROUTER_API_URL, {
+  const response = await fetch("/api/analyze", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      "HTTP-Referer": "https://trustcheck.ai",
-      "X-Title": "TrustCheck AI",
     },
     body: JSON.stringify({
       model: MODEL,
@@ -28,27 +24,27 @@ async function callNemotron(
         { role: "system", content: systemPrompt },
         { role: "user", content: userMessage },
       ],
-      temperature: 0.3,
-      max_tokens: 2000,
-      response_format: { type: "json_object" },
+      apiKey,
+      temperature: 0.2,
+      max_tokens: 4000,
     }),
   });
 
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`API error (${response.status}): ${err}`);
+  const data = await response.json();
+
+  if (data.error) {
+    throw new Error(data.error);
   }
 
-  const data = await response.json();
   return data.choices[0]?.message?.content || "{}";
 }
 
 function parseJSON(text: string): Record<string, unknown> {
+  // Try direct parse first
   try {
-    // Try direct parse first
     return JSON.parse(text);
   } catch {
-    // Try to extract JSON from markdown code blocks
+    // Try extracting from markdown code blocks
     const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (jsonMatch) {
       try {
@@ -57,17 +53,41 @@ function parseJSON(text: string): Record<string, unknown> {
         // fall through
       }
     }
-    // Try to find JSON object in the text
+    // Try finding JSON object pattern (greedy — find the largest matching braces)
     const objectMatch = text.match(/\{[\s\S]*\}/);
     if (objectMatch) {
       try {
         return JSON.parse(objectMatch[0]);
       } catch {
-        // fall through
+        // Try cleaning common issues
+        try {
+          const cleaned = objectMatch[0]
+            .replace(/,\s*}/g, "}")
+            .replace(/,\s*]/g, "]")
+            .replace(/'/g, '"')
+            .replace(/\n/g, " ");
+          return JSON.parse(cleaned);
+        } catch {
+          // fall through
+        }
       }
     }
     return { raw: text };
   }
+}
+
+// Robust field extraction helpers
+function extractField<T>(
+  obj: Record<string, unknown>,
+  keys: string[],
+  fallback: T
+): T {
+  for (const key of keys) {
+    if (obj[key] !== undefined && obj[key] !== null) {
+      return obj[key] as T;
+    }
+  }
+  return fallback;
 }
 
 export async function runPipeline(
@@ -172,7 +192,6 @@ export async function runPipeline(
     })(),
   ]);
 
-  // Process OSINT result
   if (osintResult.status === "fulfilled") {
     const data = parseJSON(osintResult.value.output);
     const r: AgentResult = {
@@ -197,7 +216,6 @@ export async function runPipeline(
     });
   }
 
-  // Process Forensic result
   if (forensicResult.status === "fulfilled") {
     const data = parseJSON(forensicResult.value.output);
     const r: AgentResult = {
@@ -277,15 +295,45 @@ export async function runPipeline(
     results.push(result6);
     callbacks.onAgentComplete(verdictAgent.id, result6);
 
-    // Build final report from verdict
     const v = verdictData as Record<string, unknown>;
+
+    // Robust extraction with many fallback field names
+    const score = extractField<number>(v, [
+      "trustScore", "trust_score", "TrustScore", "score", "Score",
+      "trust_rating", "trustRating", "rating", "overall_score", "overallScore"
+    ], 50);
+
+    const verdict = extractField<string>(v, [
+      "verdict", "Verdict", "final_verdict", "finalVerdict", "FinalVerdict",
+      "assessment", "conclusion", "analysis", "determination", "judgment"
+    ], "Analysis complete.");
+
+    const severity = extractField<TrustReport["severity"]>(v, [
+      "severity", "Severity", "risk_level", "riskLevel", "RiskLevel",
+      "threat_level", "threatLevel", "danger_level", "dangerLevel",
+      "overall_risk", "overallRisk"
+    ], "MODERATE_RISK");
+
+    const summary = extractField<string>(v, [
+      "summary", "Summary", "analysis_summary", "analysisSummary",
+      "overall_summary", "overallSummary", "description", "overview",
+      "findings_summary", "findingsSummary", "executive_summary",
+      "executiveSummary", "report_summary", "reportSummary"
+    ], "");
+
+    const recommendations = extractField<string[]>(v, [
+      "recommendations", "Recommendations", "actions", "suggested_actions",
+      "suggestedActions", "advice", "next_steps", "nextSteps",
+      "action_items", "actionItems", "steps", "suggestions"
+    ], []);
+
     return {
-      score: (v.trustScore as number) ?? 50,
-      verdict: (v.verdict as string) ?? "Analysis complete.",
-      severity: (v.severity as TrustReport["severity"]) ?? "MODERATE_RISK",
+      score: Math.max(0, Math.min(100, Math.round(Number(score) || 50))),
+      verdict,
+      severity,
       agentResults: results,
-      summary: (v.summary as string) ?? "",
-      recommendations: (v.recommendations as string[]) ?? [],
+      summary,
+      recommendations: Array.isArray(recommendations) ? recommendations : [],
     };
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
@@ -297,14 +345,13 @@ export async function runPipeline(
       findings: errMsg,
     });
 
-    // Fallback report
     return {
       score: 50,
       verdict: "Analysis partially complete. Some agents encountered errors.",
       severity: "MODERATE_RISK",
       agentResults: results,
-      summary: "The analysis could not be fully completed.",
-      recommendations: ["Try again or manually verify the content."],
+      summary: "The analysis could not be fully completed due to errors in the verdict synthesis stage.",
+      recommendations: ["Try running the analysis again.", "Manually verify the content using other sources.", "Exercise caution until verification is complete."],
     };
   }
 }
